@@ -73,6 +73,7 @@ import org.apache.pulsar.client.impl.transaction.TransactionImpl;
 import org.apache.pulsar.client.util.ExecutorProvider;
 import org.apache.pulsar.common.api.proto.CommandAck.AckType;
 import org.apache.pulsar.common.api.proto.CommandGetTopicsOfNamespace;
+import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.partition.PartitionedTopicMetadata;
 import org.apache.pulsar.common.util.CompletableFutureCancellationHandler;
@@ -798,8 +799,14 @@ public class MultiTopicsConsumerImpl<T> extends ConsumerBase<T> {
         internalPinnedExecutor.execute(() -> {
             incomingQueueLock.lock();
             try {
+                long targetEpoch = CONSUMER_EPOCH.get(this);
+                boolean singleActiveSubType = isSingleActiveSubType();
                 consumers.values().stream().forEach(consumer -> {
-                    consumer.redeliverUnacknowledgedMessages();
+                    if (singleActiveSubType) {
+                        consumer.redeliverUnacknowledgedMessagesToEpoch(targetEpoch);
+                    } else {
+                        consumer.redeliverUnacknowledgedMessages();
+                    }
                     consumer.unAckedChunkedMessageIdSequenceMap.clear();
                 });
                 clearIncomingMessages();
@@ -1309,6 +1316,7 @@ public class MultiTopicsConsumerImpl<T> extends ConsumerBase<T> {
                     return newConsumer;
                 }
             });
+            synchronizeConsumerEpoch(consumer);
             synchronizeConsumerPauseState(consumer);
         }
 
@@ -1361,6 +1369,20 @@ public class MultiTopicsConsumerImpl<T> extends ConsumerBase<T> {
                 partitionIndex, true, listener != null, subFuture,
                 startMessageId, schema, this.internalConsumerInterceptors,
                 createIfDoesNotExist, startMessageRollbackDurationInSec);
+    }
+
+    private boolean isSingleActiveSubType() {
+        return getSubType() == SubType.Failover || getSubType() == SubType.Exclusive;
+    }
+
+    // Reconcile after compute publishes the child, so a redelivery that ran before publication still advances it.
+    private void synchronizeConsumerEpoch(ConsumerImpl<T> consumer) {
+        if (isSingleActiveSubType()) {
+            long targetEpoch = CONSUMER_EPOCH.get(this);
+            if (CONSUMER_EPOCH.get(consumer) < targetEpoch) {
+                consumer.redeliverUnacknowledgedMessagesToEpoch(targetEpoch);
+            }
+        }
     }
 
     // The child must already be published. Sharing the parent transition lock ensures that either
@@ -1651,6 +1673,7 @@ public class MultiTopicsConsumerImpl<T> extends ConsumerBase<T> {
             return newConsumerSupplier.get();
         });
         // Reconcile after compute publishes the child, without holding a map lock together with pauseMutex.
+        synchronizeConsumerEpoch(consumer);
         synchronizeConsumerPauseState(consumer);
         // return the subscribe future
         return consumer.subscribeFuture();

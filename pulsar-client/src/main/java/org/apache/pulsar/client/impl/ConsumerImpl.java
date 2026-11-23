@@ -2635,6 +2635,14 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
 
     @Override
     public void redeliverUnacknowledgedMessages() {
+        redeliverUnacknowledgedMessages(false, 0L);
+    }
+
+    void redeliverUnacknowledgedMessagesToEpoch(long targetEpoch) {
+        redeliverUnacknowledgedMessages(true, targetEpoch);
+    }
+
+    private void redeliverUnacknowledgedMessages(boolean useTargetEpoch, long targetEpoch) {
         // First : synchronized in order to handle consumer reconnect produce race condition, when broker receive
         // redeliverUnacknowledgedMessages and consumer have not be created and
         // then receive reconnect epoch change the broker is smaller than the client epoch, this will cause client epoch
@@ -2661,11 +2669,15 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
             int currentSize;
             incomingQueueLock.lock();
             try {
-                // we should increase epoch every time, because MultiTopicsConsumerImpl also increase it,
-                // we need to keep both epochs the same
+                // Standalone redeliveries increment the epoch; parent-driven redeliveries advance to at least
+                // targetEpoch while still clearing the local queue and asking the broker to redeliver.
                 if (conf.getSubscriptionType() == SubscriptionType.Failover
                         || conf.getSubscriptionType() == SubscriptionType.Exclusive) {
-                    CONSUMER_EPOCH.incrementAndGet(this);
+                    if (useTargetEpoch) {
+                        CONSUMER_EPOCH.set(this, Math.max(CONSUMER_EPOCH.get(this), targetEpoch));
+                    } else {
+                        CONSUMER_EPOCH.incrementAndGet(this);
+                    }
                 }
 
                 // clear local message

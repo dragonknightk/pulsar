@@ -21,11 +21,15 @@ package org.apache.pulsar.client.impl;
 import static org.apache.pulsar.client.impl.ClientTestFixtures.createDelayedCompletedFuture;
 import static org.apache.pulsar.client.impl.ClientTestFixtures.createExceptionFuture;
 import static org.apache.pulsar.client.impl.ClientTestFixtures.createPulsarClientMockWithMockedClientCnx;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -36,18 +40,27 @@ import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.expectThrows;
 import com.google.common.collect.Sets;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPromise;
+import io.netty.channel.DefaultChannelPromise;
 import io.netty.channel.EventLoopGroup;
 import io.netty.util.HashedWheelTimer;
 import io.netty.util.Timer;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.concurrent.ImmediateEventExecutor;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -56,6 +69,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import lombok.Cleanup;
 import org.apache.pulsar.client.api.BatchReceivePolicy;
@@ -68,9 +82,17 @@ import org.apache.pulsar.client.api.Schema;
 import org.apache.pulsar.client.api.SubscriptionType;
 import org.apache.pulsar.client.impl.conf.ClientConfigurationData;
 import org.apache.pulsar.client.impl.conf.ConsumerConfigurationData;
+import org.apache.pulsar.client.impl.metrics.InstrumentProvider;
 import org.apache.pulsar.client.util.ExecutorProvider;
+import org.apache.pulsar.common.api.proto.BaseCommand;
+import org.apache.pulsar.common.api.proto.CommandMessage;
+import org.apache.pulsar.common.api.proto.CommandRedeliverUnacknowledgedMessages;
+import org.apache.pulsar.common.api.proto.CommandSubscribe;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
+import org.apache.pulsar.common.api.proto.ProtocolVersion;
+import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.partition.PartitionedTopicMetadata;
+import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.util.netty.EventLoopUtil;
 import org.awaitility.Awaitility;
 import org.testng.annotations.AfterMethod;
@@ -822,4 +844,372 @@ public class MultiTopicsConsumerImplTest {
         assertTrue(((CompletableFuture<Messages<byte[]>>) receive).complete(messages));
     }
 
+
+    @DataProvider
+    public static Object[][] singleActiveSubscriptionTypes() {
+        return new Object[][] {{SubscriptionType.Exclusive}, {SubscriptionType.Failover}};
+    }
+
+    // Regression test for issue 27694: a child consumer added after redeliverUnacknowledgedMessages() must advance
+    // to the parent's current epoch, otherwise Exclusive/Failover discards its deliveries as stale.
+    @Test(timeOut = 10000, dataProvider = "singleActiveSubscriptionTypes")
+    public void testPartitionAddedAfterRedeliverReceivesMessages(SubscriptionType subscriptionType) throws Exception {
+        String baseTopic = "persistent://public/default/partition-epoch-test";
+        AtomicInteger partitionCount = new AtomicInteger(1);
+        try (EpochTrackingBroker broker = new EpochTrackingBroker()) {
+            PulsarClientImpl clientMock = createEpochTrackingClient(broker, partitionCount);
+            MultiTopicsConsumerImpl<byte[]> consumer = createSubscribedPartitionedConsumer(
+                    clientMock, baseTopic, subscriptionType);
+            try {
+                consumer.redeliverUnacknowledgedMessages();
+                drainPinnedExecutor(consumer);
+
+                String p0 = TopicName.get(baseTopic).getPartition(0).toString();
+                String p1 = TopicName.get(baseTopic).getPartition(1).toString();
+                assertThat(broker.getEpoch(consumer.consumers.get(p0).consumerId)).isEqualTo(1L);
+
+                partitionCount.set(2);
+                PartitionsChangedListener listener = consumer.topicsPartitionChangedListener;
+                listener.onTopicsExtended(Collections.singletonList(baseTopic)).get(5, TimeUnit.SECONDS);
+                drainPinnedExecutor(consumer);
+
+                ConsumerImpl<byte[]> p1Consumer = consumer.consumers.get(p1);
+                assertThat(p1Consumer).isNotNull();
+                assertThat(broker.getEpoch(p1Consumer.consumerId))
+                        .as("new partition must reach parent epoch 1").isEqualTo(1L);
+
+                deliverAndAssertReceived(consumer, p1Consumer, broker.cnx, p1, 1L, 0L, 1L);
+
+                consumer.redeliverUnacknowledgedMessages();
+                drainPinnedExecutor(consumer);
+                assertThat(broker.getEpoch(consumer.consumers.get(p0).consumerId)).isEqualTo(2L);
+                assertThat(broker.getEpoch(p1Consumer.consumerId)).isEqualTo(2L);
+
+                deliverAndAssertReceived(consumer, p1Consumer, broker.cnx, p1, 1L, 1L, 2L);
+            } finally {
+                consumer.closeAsync().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    // Regression test for issue 27694: covers both non-partitioned and partitioned branches of
+    // doSubscribeTopicPartitions when new topics are subscribed after a parent redelivery.
+    @Test(timeOut = 10000)
+    public void testTopicsSubscribedAfterRedeliverReceiveMessages() throws Exception {
+        String initialTopic = "persistent://public/default/initial-non-part";
+        String addedNonPartitioned = "persistent://public/default/added-non-part";
+        String addedPartitioned = "persistent://public/default/added-part";
+        try (EpochTrackingBroker broker = new EpochTrackingBroker()) {
+            PulsarClientImpl clientMock = createEpochTrackingClient(broker, new AtomicInteger(1));
+            when(clientMock.getPartitionedTopicMetadata(anyString(), anyBoolean(), anyBoolean()))
+                    .thenAnswer(inv -> CompletableFuture.completedFuture(new PartitionedTopicMetadata(
+                            addedPartitioned.equals(inv.getArgument(0))
+                                    ? 1 : PartitionedTopicMetadata.NON_PARTITIONED)));
+
+            ConsumerConfigurationData<byte[]> conf = new ConsumerConfigurationData<>();
+            conf.setSubscriptionName("sub-multi-epoch");
+            conf.setSubscriptionType(SubscriptionType.Exclusive);
+            conf.setTopicNames(Sets.newHashSet(initialTopic));
+            CompletableFuture<Consumer<byte[]>> subscribeFuture = new CompletableFuture<>();
+            MultiTopicsConsumerImpl<byte[]> consumer = new MultiTopicsConsumerImpl<>(
+                    clientMock, conf, executorProvider, subscribeFuture, Schema.BYTES, null, true);
+            try {
+                assertThat(subscribeFuture.get(5, TimeUnit.SECONDS)).isSameAs(consumer);
+                consumer.redeliverUnacknowledgedMessages();
+                drainPinnedExecutor(consumer);
+
+                consumer.subscribeAsync(addedNonPartitioned, true).get(5, TimeUnit.SECONDS);
+                consumer.subscribeAsync(addedPartitioned, true).get(5, TimeUnit.SECONDS);
+                drainPinnedExecutor(consumer);
+
+                ConsumerImpl<byte[]> nonPartConsumer = consumer.consumers.get(addedNonPartitioned);
+                String addedPart0 = TopicName.get(addedPartitioned).getPartition(0).toString();
+                ConsumerImpl<byte[]> partConsumer = consumer.consumers.get(addedPart0);
+                assertThat(broker.getEpoch(nonPartConsumer.consumerId)).isEqualTo(1L);
+                assertThat(broker.getEpoch(partConsumer.consumerId)).isEqualTo(1L);
+
+                deliverBrokerMessage(nonPartConsumer, broker.cnx, 2L, 0L, 1L);
+                deliverBrokerMessage(partConsumer, broker.cnx, 3L, 0L, 1L);
+                Message<byte[]> msg1 = consumer.receive(1, TimeUnit.SECONDS);
+                Message<byte[]> msg2 = consumer.receive(1, TimeUnit.SECONDS);
+                try {
+                    assertThat(msg1).isNotNull();
+                    assertThat(msg2).isNotNull();
+                    assertThat(Sets.newHashSet(msg1.getTopicName(), msg2.getTopicName()))
+                            .containsExactlyInAnyOrder(addedNonPartitioned, addedPart0);
+                } finally {
+                    if (msg1 != null) {
+                        msg1.release();
+                    }
+                    if (msg2 != null) {
+                        msg2.release();
+                    }
+                }
+            } finally {
+                consumer.closeAsync().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    // Regression test for issue 27694: verifies concurrent redelivery neither misses a child before map
+    // publication nor double-increments a child that already reconciled to the new epoch.
+    @Test(timeOut = 10000)
+    public void testConcurrentRedeliverDuringPartitionAddKeepsEpochsAligned() throws Exception {
+        String baseTopic = "persistent://public/default/concurrent-epoch-test";
+        AtomicInteger partitionCount = new AtomicInteger(1);
+        try (EpochTrackingBroker broker = new EpochTrackingBroker()) {
+            PulsarClientImpl clientMock = createEpochTrackingClient(broker, partitionCount);
+            MultiTopicsConsumerImpl<byte[]> consumer = createSubscribedPartitionedConsumer(
+                    clientMock, baseTopic, SubscriptionType.Exclusive);
+            try {
+                // Race A: redelivery runs while partition 1 is constructed before consumers.compute publishes it.
+                AtomicLong consumerIds = new AtomicLong(100);
+                when(clientMock.newConsumerId()).thenAnswer(inv -> {
+                    long id = consumerIds.incrementAndGet();
+                    if (id == 101) {
+                        consumer.redeliverUnacknowledgedMessages();
+                        drainPinnedExecutor(consumer);
+                    }
+                    return id;
+                });
+
+                partitionCount.set(2);
+                PartitionsChangedListener listener = consumer.topicsPartitionChangedListener;
+                listener.onTopicsExtended(Collections.singletonList(baseTopic)).get(5, TimeUnit.SECONDS);
+                drainPinnedExecutor(consumer);
+
+                String p1 = TopicName.get(baseTopic).getPartition(1).toString();
+                ConsumerImpl<byte[]> p1Consumer = consumer.consumers.get(p1);
+                assertThat(broker.getEpoch(p1Consumer.consumerId))
+                        .as("post-publish reconciliation must align missed child to epoch 1").isEqualTo(1L);
+                deliverAndAssertReceived(consumer, p1Consumer, broker.cnx, p1, 4L, 0L, 1L);
+
+                // Race B: parent bumps 1 -> 2 while pinned executor is held, p2 reconciles to 2, then queued
+                // redeliver task visits p2. Epoch must stay 2, while pre-redeliver queued messages still drop.
+                CountDownLatch holdPinned = holdPinnedExecutor(consumer);
+                consumer.redeliverUnacknowledgedMessages();
+                partitionCount.set(3);
+                listener.onTopicsExtended(Collections.singletonList(baseTopic)).get(5, TimeUnit.SECONDS);
+                holdPinned.countDown();
+                drainPinnedExecutor(consumer);
+
+                String p2 = TopicName.get(baseTopic).getPartition(2).toString();
+                ConsumerImpl<byte[]> p2Consumer = consumer.consumers.get(p2);
+                assertThat(broker.getEpoch(p2Consumer.consumerId)).isEqualTo(2L);
+                assertThat(p2Consumer.getConsumerEpoch()).isEqualTo(2L);
+
+                deliverBrokerMessage(p2Consumer, broker.cnx, 5L, 0L, 2L);
+                Awaitility.await().atMost(5, TimeUnit.SECONDS)
+                        .untilAsserted(() -> assertThat(consumer.getTotalIncomingMessages()).isEqualTo(1));
+                CountDownLatch holdClear = holdPinnedExecutor(consumer);
+                try {
+                    consumer.redeliverUnacknowledgedMessages();
+                    assertThat(consumer.receive(100, TimeUnit.MILLISECONDS))
+                            .as("pre-redeliver epoch-2 message must be dropped right after redeliver").isNull();
+                } finally {
+                    holdClear.countDown();
+                }
+                drainPinnedExecutor(consumer);
+                assertThat(broker.getEpoch(p2Consumer.consumerId)).isEqualTo(3L);
+            } finally {
+                consumer.closeAsync().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    // Regression test for issue 27694: if a child already advanced its epoch (e.g. via negative-ack redelivery on
+    // Exclusive), a subsequent parent redeliver must still clear the child queue and send redeliver to the broker.
+    @Test(timeOut = 10000)
+    public void testParentRedeliverStillRedeliversAfterChildEpochAdvances() throws Exception {
+        String baseTopic = "persistent://public/default/nack-parent-epoch-test";
+        try (EpochTrackingBroker broker = new EpochTrackingBroker()) {
+            PulsarClientImpl clientMock = createEpochTrackingClient(broker, new AtomicInteger(1));
+            MultiTopicsConsumerImpl<byte[]> consumer = createSubscribedPartitionedConsumer(
+                    clientMock, baseTopic, SubscriptionType.Exclusive);
+            try {
+                String p0 = TopicName.get(baseTopic).getPartition(0).toString();
+                ConsumerImpl<byte[]> p0Consumer = consumer.consumers.get(p0);
+
+                // Child-only full redelivery (used by nack/DLQ/reconsumeLater failures) advances child epoch 0 -> 1.
+                p0Consumer.redeliverUnacknowledgedMessages(Collections.singleton(new MessageIdImpl(1L, 0L, 0)));
+                assertThat(broker.getEpoch(p0Consumer.consumerId)).isEqualTo(1L);
+                assertThat(broker.getRedeliverCount(p0Consumer.consumerId)).isEqualTo(1);
+
+                deliverBrokerMessage(p0Consumer, broker.cnx, 1L, 0L, 1L);
+                Awaitility.await().atMost(5, TimeUnit.SECONDS)
+                        .untilAsserted(() -> assertThat(consumer.getTotalIncomingMessages()).isEqualTo(1));
+
+                // Parent redelivery bumps parent 0 -> 1 (matching child's epoch 1) and must still command redelivery.
+                consumer.redeliverUnacknowledgedMessages();
+                drainPinnedExecutor(consumer);
+                assertThat(broker.getRedeliverCount(p0Consumer.consumerId))
+                        .as("parent redeliver must send redeliver command even when child epoch == targetEpoch")
+                        .isEqualTo(2);
+                assertThat(broker.getEpoch(p0Consumer.consumerId)).isEqualTo(1L);
+                assertThat(p0Consumer.getConsumerEpoch()).isEqualTo(1L);
+
+                deliverAndAssertReceived(consumer, p0Consumer, broker.cnx, p0, 1L, 0L, 1L);
+            } finally {
+                consumer.closeAsync().get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    private MultiTopicsConsumerImpl<byte[]> createSubscribedPartitionedConsumer(
+            PulsarClientImpl clientMock, String baseTopic, SubscriptionType subscriptionType) throws Exception {
+        ConsumerConfigurationData<byte[]> conf = new ConsumerConfigurationData<>();
+        conf.setSubscriptionName("sub-epoch");
+        conf.setSubscriptionType(subscriptionType);
+        conf.setAutoUpdatePartitions(true);
+        conf.setTopicNames(Sets.newHashSet(baseTopic));
+        CompletableFuture<Consumer<byte[]>> subscribeFuture = new CompletableFuture<>();
+        MultiTopicsConsumerImpl<byte[]> consumer = MultiTopicsConsumerImpl.createPartitionedConsumer(
+                clientMock, conf, executorProvider, subscribeFuture, 1, Schema.BYTES, null);
+        assertThat(subscribeFuture.get(5, TimeUnit.SECONDS)).isSameAs(consumer);
+        drainPinnedExecutor(consumer);
+        return consumer;
+    }
+
+    private static void drainPinnedExecutor(MultiTopicsConsumerImpl<byte[]> consumer) throws Exception {
+        consumer.internalPinnedExecutor.submit(() -> { }).get(5, TimeUnit.SECONDS);
+    }
+
+    private static CountDownLatch holdPinnedExecutor(MultiTopicsConsumerImpl<byte[]> consumer) {
+        CountDownLatch latch = new CountDownLatch(1);
+        consumer.internalPinnedExecutor.execute(() -> {
+            try {
+                latch.await(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        return latch;
+    }
+
+    private static void deliverAndAssertReceived(
+            MultiTopicsConsumerImpl<byte[]> consumer, ConsumerImpl<byte[]> child, ClientCnx cnx,
+            String topic, long ledgerId, long entryId, long epoch) throws Exception {
+        deliverBrokerMessage(child, cnx, ledgerId, entryId, epoch);
+        Message<byte[]> received = consumer.receive(1, TimeUnit.SECONDS);
+        try {
+            assertThat(received).as("message from " + topic + " must be received").isNotNull();
+            assertThat(received.getTopicName()).isEqualTo(topic);
+        } finally {
+            if (received != null) {
+                received.release();
+            }
+        }
+    }
+
+    private PulsarClientImpl createEpochTrackingClient(EpochTrackingBroker broker, AtomicInteger partitionCount) {
+        PulsarClientImpl clientMock = ClientTestFixtures.createPulsarClientMockWithMockedClientCnx(
+                executorProvider, internalExecutor, broker.cnx);
+        clientMock.getConfiguration().setStatsIntervalSeconds(0);
+        when(clientMock.timer()).thenReturn(broker.timer);
+        when(clientMock.instrumentProvider()).thenReturn(InstrumentProvider.NOOP);
+        when(clientMock.getMemoryLimitController()).thenReturn(new MemoryLimitController(1024 * 1024));
+        AtomicLong requestIds = new AtomicLong();
+        AtomicLong consumerIds = new AtomicLong();
+        when(clientMock.newRequestId()).thenAnswer(inv -> requestIds.incrementAndGet());
+        when(clientMock.newConsumerId()).thenAnswer(inv -> consumerIds.incrementAndGet());
+        when(clientMock.getPartitionsForTopic(anyString(), anyBoolean())).thenAnswer(inv -> {
+            String topic = inv.getArgument(0);
+            int count = partitionCount.get();
+            List<String> partitions = new ArrayList<>(count);
+            for (int i = 0; i < count; i++) {
+                partitions.add(TopicName.get(topic).getPartition(i).toString());
+            }
+            return CompletableFuture.completedFuture(partitions);
+        });
+        return clientMock;
+    }
+
+    private static void deliverBrokerMessage(ConsumerImpl<byte[]> partitionConsumer, ClientCnx cnx,
+                                             long ledgerId, long entryId, long consumerEpoch) {
+        MessageMetadata metadata = new MessageMetadata()
+                .setProducerName("p").setSequenceId(entryId).setPublishTime(System.currentTimeMillis());
+        ByteBuf payload = Unpooled.wrappedBuffer(new byte[]{1, 2, 3});
+        ByteBuf headersAndPayload = Commands.serializeMetadataAndPayload(
+                Commands.ChecksumType.None, metadata, payload);
+        payload.release();
+        try {
+            CommandMessage cmd = new CommandMessage()
+                    .setConsumerId(partitionConsumer.consumerId)
+                    .setConsumerEpoch(consumerEpoch);
+            cmd.setMessageId().setLedgerId(ledgerId).setEntryId(entryId);
+            partitionConsumer.messageReceived(cmd, headersAndPayload, cnx);
+        } finally {
+            headersAndPayload.release();
+        }
+    }
+
+    private static final class EpochTrackingBroker implements AutoCloseable {
+        final ClientCnx cnx = mock(ClientCnx.class);
+        final Timer timer = new HashedWheelTimer(
+                new DefaultThreadFactory("epoch-test-timer", true), 1, TimeUnit.MILLISECONDS);
+        private final Map<Long, Long> consumerEpochs = new ConcurrentHashMap<>();
+        private final Map<Long, AtomicInteger> redeliverCounts = new ConcurrentHashMap<>();
+
+        EpochTrackingBroker() {
+            ChannelHandlerContext ctx = mock(ChannelHandlerContext.class);
+            Channel channel = mock(Channel.class);
+            ChannelPromise promise = mock(ChannelPromise.class);
+            when(cnx.ctx()).thenReturn(ctx);
+            when(cnx.channel()).thenReturn(channel);
+            when(cnx.getMaxMessageSize()).thenReturn(Commands.DEFAULT_MAX_MESSAGE_SIZE);
+            when(cnx.getRemoteEndpointProtocolVersion()).thenReturn(ProtocolVersion.v12_VALUE);
+            when(ctx.channel()).thenReturn(channel);
+            when(ctx.voidPromise()).thenReturn(promise);
+            doAnswer(inv -> handleWrite(inv.getArgument(0), channel))
+                    .when(ctx).writeAndFlush(any(ByteBuf.class), any(ChannelPromise.class));
+            doAnswer(inv -> handleWrite(inv.getArgument(0), channel)).when(ctx).writeAndFlush(any(ByteBuf.class));
+            when(cnx.sendRequestWithId(any(ByteBuf.class), anyLong())).thenAnswer(inv -> {
+                BaseCommand command = decodeAndRelease(inv.getArgument(0));
+                if (command.getType() == BaseCommand.Type.SUBSCRIBE) {
+                    CommandSubscribe sub = command.getSubscribe();
+                    long epoch = sub.hasConsumerEpoch() ? sub.getConsumerEpoch() : Commands.DEFAULT_CONSUMER_EPOCH;
+                    consumerEpochs.put(sub.getConsumerId(), epoch);
+                }
+                return CompletableFuture.<ProducerResponse>completedFuture(null);
+            });
+        }
+
+        long getEpoch(long consumerId) {
+            return consumerEpochs.getOrDefault(consumerId, Commands.DEFAULT_CONSUMER_EPOCH);
+        }
+
+        int getRedeliverCount(long consumerId) {
+            AtomicInteger count = redeliverCounts.get(consumerId);
+            return count == null ? 0 : count.get();
+        }
+
+        private ChannelPromise handleWrite(ByteBuf frame, Channel channel) {
+            BaseCommand command = decodeAndRelease(frame);
+            if (command.getType() == BaseCommand.Type.REDELIVER_UNACKNOWLEDGED_MESSAGES) {
+                CommandRedeliverUnacknowledgedMessages redeliver = command.getRedeliverUnacknowledgedMessages();
+                redeliverCounts.computeIfAbsent(redeliver.getConsumerId(), __ -> new AtomicInteger()).incrementAndGet();
+                if (redeliver.hasConsumerEpoch()) {
+                    consumerEpochs.merge(redeliver.getConsumerId(), redeliver.getConsumerEpoch(), Math::max);
+                }
+            }
+            return new DefaultChannelPromise(channel, ImmediateEventExecutor.INSTANCE).setSuccess();
+        }
+
+        @Override
+        public void close() {
+            timer.stop();
+        }
+
+        private static BaseCommand decodeAndRelease(ByteBuf frame) {
+            try {
+                frame.skipBytes(Integer.BYTES);
+                int size = (int) frame.readUnsignedInt();
+                BaseCommand command = new BaseCommand();
+                command.parseFrom(frame, size);
+                return command;
+            } finally {
+                frame.release();
+            }
+        }
+    }
 }
